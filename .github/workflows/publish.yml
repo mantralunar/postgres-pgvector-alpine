@@ -20,6 +20,7 @@ env:
 jobs:
   publish:
     runs-on: ubuntu-latest
+
     steps:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -110,8 +111,9 @@ jobs:
           BUILD_DIR: ${{ runner.temp }}/pgvector-build
         run: |
           mkdir -p "$BUILD_DIR"
+
           cat > "$BUILD_DIR/Containerfile" <<'CONTAINERFILE'
-          ARG POSTGRES_IMAGE
+          ARG POSTGRES_IMAGE=docker.io/library/postgres:17-alpine
           FROM ${POSTGRES_IMAGE}
 
           ARG PGVECTOR_VERSION
@@ -120,14 +122,14 @@ jobs:
                 org.opencontainers.image.licenses="PostgreSQL"
 
           RUN apk add --no-cache --virtual .pgvector-build \
-                  build-base clang git llvm-dev \
+                  build-base git \
               && git clone \
                   --branch "v${PGVECTOR_VERSION}" \
                   --depth 1 \
                   https://github.com/pgvector/pgvector.git \
                   /tmp/pgvector \
-              && make -C /tmp/pgvector OPTFLAGS="" \
-              && make -C /tmp/pgvector install \
+              && make -C /tmp/pgvector OPTFLAGS="" with_llvm=no \
+              && make -C /tmp/pgvector install with_llvm=no \
               && mkdir -p /usr/local/share/doc/pgvector \
               && cp /tmp/pgvector/LICENSE /tmp/pgvector/README.md \
                   /usr/local/share/doc/pgvector/ \
@@ -172,14 +174,17 @@ jobs:
             if docker exec "$container" pg_isready -U postgres >/dev/null 2>&1; then
               break
             fi
+
             if (( attempt == 30 )); then
               docker logs "$container"
               exit 1
             fi
+
             sleep 1
           done
 
-          docker exec "$container" psql -v ON_ERROR_STOP=1 -U postgres <<'SQL'
+          docker exec "$container" \
+            psql -v ON_ERROR_STOP=1 -U postgres <<'SQL'
           CREATE EXTENSION vector;
           CREATE TABLE smoke_items (embedding vector(3));
           INSERT INTO smoke_items VALUES ('[1,2,3]');
