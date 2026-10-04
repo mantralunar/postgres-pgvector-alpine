@@ -27,23 +27,48 @@ jobs:
       - name: Resolve upstream versions
         id: upstream
         shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
 
-          pgvector_version="$({
-            git ls-remote --tags --refs \
-              https://github.com/pgvector/pgvector.git 'v[0-9]*'
-          } | sed -n 's#.*refs/tags/v##p' \
-            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
-            | sort -V \
-            | tail -n 1)"
+          tags_json="$(curl \
+            --fail \
+            --show-error \
+            --silent \
+            --retry 4 \
+            --retry-all-errors \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            'https://api.github.com/repos/pgvector/pgvector/tags?per_page=100')"
+
+          pgvector_version="$(
+            jq -r '.[].name' <<< "$tags_json" \
+              | sed -n 's/^v//p' \
+              | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sort -V \
+              | tail -n 1
+          )"
+
+          if [[ -z "$pgvector_version" ]]; then
+            echo "No stable pgvector version was returned by the GitHub tags API" >&2
+            exit 1
+          fi
 
           postgres_digest="$({
             docker buildx imagetools inspect "$POSTGRES_IMAGE"
           } | awk '/^Digest:/ { print $2; exit }')"
 
-          [[ "$pgvector_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
-          [[ "$postgres_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          if [[ ! "$pgvector_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid pgvector version: $pgvector_version" >&2
+            exit 1
+          fi
+
+          if [[ ! "$postgres_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Could not resolve a valid digest for $POSTGRES_IMAGE" >&2
+            exit 1
+          fi
 
           digest_short="${postgres_digest#sha256:}"
           digest_short="${digest_short:0:12}"
