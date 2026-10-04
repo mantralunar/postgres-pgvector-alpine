@@ -56,9 +56,14 @@ jobs:
             exit 1
           fi
 
-          postgres_digest="$({
+          postgres_inspect="$(
             docker buildx imagetools inspect "$POSTGRES_IMAGE"
-          } | awk '/^Digest:/ { print $2; exit }')"
+          )"
+
+          postgres_digest="$(
+            awk '/^Digest:/ && !found { print $2; found=1 }' \
+              <<< "$postgres_inspect"
+          )"
 
           if [[ ! "$pgvector_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "Invalid pgvector version: $pgvector_version" >&2
