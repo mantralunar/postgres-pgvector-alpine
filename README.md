@@ -1,56 +1,51 @@
-# PostgreSQL 17 Alpine with pgvector
+# PostgreSQL Alpine with pgvector
 
-This repository needs only one workflow file. GitHub Actions creates the temporary container build instructions, compiles pgvector against `postgres:17-alpine`, tests it, and publishes the resulting `linux/amd64` image to GitHub Container Registry.
+PostgreSQL 17 on Alpine Linux with the [pgvector](https://github.com/pgvector/pgvector) extension preinstalled.
 
-## Repository contents
+The image is based directly on the official `postgres:17-alpine` image. It keeps the standard PostgreSQL entrypoint, environment variables, data directory, and initialization behaviour.
+
+## Image
 
 ```text
-.github/workflows/publish.yml
-README.md
+ghcr.io/OWNER/postgres-pgvector-alpine:17-alpine
 ```
 
-## Setup
+Replace `OWNER` with the GitHub account or organization that publishes the image.
 
-1. Create a GitHub repository.
-2. Add `.github/workflows/publish.yml` from this repository.
-3. Optionally add this README.
-4. Push to the default branch.
-5. Open **Settings → Actions → General** and give workflows read and write permissions.
-6. Open **Actions**, select **Build PostgreSQL Alpine with pgvector**, and choose **Run workflow**.
-7. Open the generated package and make it public if anonymous pulls are required.
+The image supports `linux/amd64`.
 
-The workflow uses GitHub's automatically provided `GITHUB_TOKEN`; no registry password or repository secret is required.
+## Tags
 
-## Published image
+- `17-alpine` — latest successful PostgreSQL 17 Alpine build.
+- `<pgvector-version>-pg17-alpine` — a specific pgvector release on the latest available PostgreSQL 17 Alpine base.
+- `<pgvector-version>-pg17-alpine-<digest>` — an immutable pgvector and PostgreSQL base-image combination.
 
-For a repository at `github.com/example/postgres-pgvector`, pull:
+Use the digest-suffixed tag for reproducible deployments.
+
+## Run a new instance
 
 ```sh
-podman pull ghcr.io/example/postgres-pgvector:17-alpine
+podman volume create postgres-data
+
+podman run -d \
+  --name postgres \
+  -p 127.0.0.1:5432:5432 \
+  -e POSTGRES_PASSWORD='replace-me' \
+  -v postgres-data:/var/lib/postgresql/data \
+  ghcr.io/OWNER/postgres-pgvector-alpine:17-alpine
 ```
 
-The workflow publishes three tags:
+For production, provide the password with a Podman secret rather than placing it directly in the command.
 
-- `17-alpine` — latest successful build;
-- `<pgvector-version>-pg17-alpine` — latest PostgreSQL Alpine base for that pgvector release;
-- `<pgvector-version>-pg17-alpine-<digest>` — immutable upstream combination.
+## Enable pgvector
 
-Use the digest-suffixed tag for reproducible production deployments.
+pgvector is available in the image but is not enabled automatically. Enable it separately in each database that needs it:
 
-## Automatic updates
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+```
 
-The workflow runs daily at 04:23 UTC. It checks:
-
-- the latest stable pgvector Git tag;
-- the current multi-platform digest behind `postgres:17-alpine`.
-
-A new image is built when either upstream value changes. If the exact combination already exists in GHCR, the scheduled run exits without rebuilding it. You can also run the workflow manually at any time.
-
-## Using the image
-
-Recreate the PostgreSQL container using the new image and the same existing PostgreSQL 17 Alpine data volume. Do not delete or initialize the volume again.
-
-Enable pgvector only in the database that needs it:
+For example:
 
 ```sh
 podman exec postgres \
@@ -58,4 +53,59 @@ podman exec postgres \
   -c 'CREATE EXTENSION IF NOT EXISTS vector;'
 ```
 
-Adding pgvector to the image only makes the extension available. It does not enable it automatically in the other databases.
+Confirm the installed version:
+
+```sql
+SELECT extversion
+FROM pg_extension
+WHERE extname = 'vector';
+```
+
+## Use an existing PostgreSQL volume
+
+This image can replace `postgres:17-alpine` while continuing to use the same PostgreSQL 17 Alpine data volume:
+
+1. Stop the existing container cleanly.
+2. Remove the container without removing its volume.
+3. Recreate it with this image and the same environment, network, and volume settings.
+4. Run `CREATE EXTENSION vector` in databases that require pgvector.
+
+Do not mount a data directory created by another PostgreSQL major version. Do not switch an existing Alpine data directory directly to a Debian-based PostgreSQL image.
+
+Installing pgvector does not modify or enable it in other databases in the same PostgreSQL instance.
+
+## Included PostgreSQL extensions
+
+The underlying PostgreSQL image also provides standard contributed extensions such as:
+
+- `pg_trgm`
+- `unaccent`
+- `uuid-ossp`
+
+Enable them in the required database in the same way:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE EXTENSION IF NOT EXISTS unaccent;
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+```
+
+## Example vector query
+
+```sql
+CREATE TABLE items (
+    id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    embedding vector(3)
+);
+
+INSERT INTO items (embedding)
+VALUES ('[1,2,3]'), ('[4,5,6]');
+
+SELECT id, embedding <-> '[1,2,4]' AS distance
+FROM items
+ORDER BY distance;
+```
+
+## Updates
+
+The moving `17-alpine` tag is rebuilt when a stable pgvector release or the official PostgreSQL 17 Alpine base image changes. Each build is tested by creating the extension, inserting a vector, and running a distance query before publication.
