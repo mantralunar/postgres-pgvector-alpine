@@ -1,0 +1,172 @@
+name: Build PostgreSQL Alpine with pgvector
+
+on:
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: publish-pgvector
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  POSTGRES_IMAGE: docker.io/library/postgres:17-alpine
+  REGISTRY: ghcr.io
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Resolve upstream versions
+        id: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          pgvector_version="$({
+            git ls-remote --tags --refs \
+              https://github.com/pgvector/pgvector.git 'v[0-9]*'
+          } | sed -n 's#.*refs/tags/v##p' \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -V \
+            | tail -n 1)"
+
+          postgres_digest="$({
+            docker buildx imagetools inspect "$POSTGRES_IMAGE"
+          } | awk '/^Digest:/ { print $2; exit }')"
+
+          [[ "$pgvector_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$postgres_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+
+          digest_short="${postgres_digest#sha256:}"
+          digest_short="${digest_short:0:12}"
+          image="${REGISTRY}/${GITHUB_REPOSITORY,,}"
+
+          echo "pgvector_version=$pgvector_version" >> "$GITHUB_OUTPUT"
+          echo "postgres_pinned=${POSTGRES_IMAGE}@${postgres_digest}" >> "$GITHUB_OUTPUT"
+          echo "postgres_digest=$postgres_digest" >> "$GITHUB_OUTPUT"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "immutable_tag=${pgvector_version}-pg17-alpine-${digest_short}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check whether this release already exists
+        id: existing
+        env:
+          IMAGE: ${{ steps.upstream.outputs.image }}
+          TAG: ${{ steps.upstream.outputs.immutable_tag }}
+        run: |
+          if docker buildx imagetools inspect "$IMAGE:$TAG" >/dev/null 2>&1; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create temporary build instructions
+        if: steps.existing.outputs.found != 'true' || github.event_name == 'workflow_dispatch'
+        env:
+          BUILD_DIR: ${{ runner.temp }}/pgvector-build
+        run: |
+          mkdir -p "$BUILD_DIR"
+          cat > "$BUILD_DIR/Containerfile" <<'CONTAINERFILE'
+          ARG POSTGRES_IMAGE
+          FROM ${POSTGRES_IMAGE}
+
+          ARG PGVECTOR_VERSION
+
+          LABEL org.opencontainers.image.description="PostgreSQL 17 Alpine with pgvector" \
+                org.opencontainers.image.licenses="PostgreSQL"
+
+          RUN apk add --no-cache --virtual .pgvector-build \
+                  build-base clang git llvm-dev \
+              && git clone \
+                  --branch "v${PGVECTOR_VERSION}" \
+                  --depth 1 \
+                  https://github.com/pgvector/pgvector.git \
+                  /tmp/pgvector \
+              && make -C /tmp/pgvector OPTFLAGS="" \
+              && make -C /tmp/pgvector install \
+              && mkdir -p /usr/local/share/doc/pgvector \
+              && cp /tmp/pgvector/LICENSE /tmp/pgvector/README.md \
+                  /usr/local/share/doc/pgvector/ \
+              && rm -rf /tmp/pgvector \
+              && apk del .pgvector-build
+          CONTAINERFILE
+
+      - name: Build image
+        if: steps.existing.outputs.found != 'true' || github.event_name == 'workflow_dispatch'
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ runner.temp }}/pgvector-build
+          file: ${{ runner.temp }}/pgvector-build/Containerfile
+          platforms: linux/amd64
+          load: true
+          tags: pgvector-smoke:local
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.upstream.outputs.pgvector_version }}
+            org.opencontainers.image.base.digest=${{ steps.upstream.outputs.postgres_digest }}
+          build-args: |
+            POSTGRES_IMAGE=${{ steps.upstream.outputs.postgres_pinned }}
+            PGVECTOR_VERSION=${{ steps.upstream.outputs.pgvector_version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test pgvector
+        if: steps.existing.outputs.found != 'true' || github.event_name == 'workflow_dispatch'
+        shell: bash
+        run: |
+          set -euo pipefail
+          container="pgvector-smoke-${GITHUB_RUN_ID}"
+          trap 'docker rm -f "$container" >/dev/null 2>&1 || true' EXIT
+
+          docker run -d \
+            --name "$container" \
+            -e POSTGRES_PASSWORD=smoke-test-only \
+            pgvector-smoke:local
+
+          for attempt in {1..30}; do
+            if docker exec "$container" pg_isready -U postgres >/dev/null 2>&1; then
+              break
+            fi
+            if (( attempt == 30 )); then
+              docker logs "$container"
+              exit 1
+            fi
+            sleep 1
+          done
+
+          docker exec "$container" psql -v ON_ERROR_STOP=1 -U postgres <<'SQL'
+          CREATE EXTENSION vector;
+          CREATE TABLE smoke_items (embedding vector(3));
+          INSERT INTO smoke_items VALUES ('[1,2,3]');
+          SELECT embedding <-> '[1,2,4]' AS distance FROM smoke_items;
+          SQL
+
+      - name: Publish tested image
+        if: steps.existing.outputs.found != 'true' || github.event_name == 'workflow_dispatch'
+        env:
+          IMAGE: ${{ steps.upstream.outputs.image }}
+          PGVECTOR_VERSION: ${{ steps.upstream.outputs.pgvector_version }}
+          IMMUTABLE_TAG: ${{ steps.upstream.outputs.immutable_tag }}
+        run: |
+          docker tag pgvector-smoke:local "$IMAGE:17-alpine"
+          docker tag pgvector-smoke:local "$IMAGE:$PGVECTOR_VERSION-pg17-alpine"
+          docker tag pgvector-smoke:local "$IMAGE:$IMMUTABLE_TAG"
+
+          docker push "$IMAGE:17-alpine"
+          docker push "$IMAGE:$PGVECTOR_VERSION-pg17-alpine"
+          docker push "$IMAGE:$IMMUTABLE_TAG"
